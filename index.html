@@ -130,13 +130,15 @@ function addCard(dev) {
     <div class="meta"><span class="dew">Harmatpont: –</span><span class="bat">Elem: –</span><span class="st">Csatlakozás…</span></div>
     <div class="legend"><span><i style="background:var(--acc)"></i>Hőmérséklet (°C)</span><span><i style="background:var(--hum)"></i>Páratartalom (%)</span></div>
     <canvas></canvas>
-    <div class="meta" style="margin-top:8px"><button class="sec dl">Előzmények letöltése a hőmérőből</button><span class="dlst"></span></div>`;
+    <div class="meta" style="margin-top:8px"><button class="sec dl">Előzmények letöltése a hőmérőből</button><button class="sec sync">Óra szinkron</button></div>
+    <div class="st dlst" style="margin-top:6px"></div>`;
   el.querySelector('.name').textContent = dev.name || 'Hőmérő';
   $('list').appendChild(el);
   const s = { dev, el, stop: false, canvas: el.querySelector('canvas'), hist: loadHist(dev), devHist: loadDev(dev), dirty: false, lastT: 0, svc: null, busy: false };
   if (s.hist.length) s.lastT = s.hist[s.hist.length - 1][0];
   devices.set(dev.id, s);
   el.querySelector('.dl').onclick = () => downloadHistory(s);
+  el.querySelector('.sync').onclick = () => syncClock(s);
   el.querySelector('.rm').onclick = () => {
     s.stop = true;
     try { dev.gatt.disconnect(); } catch (_) {}
@@ -248,6 +250,30 @@ async function downloadHistory(s) {
     try { if (hc) { hc.removeEventListener('characteristicvaluechanged', onv); await hc.stopNotifications(); } } catch (_) {}
     s.busy = false; btn.disabled = false;
   }
+}
+
+// a hőmérő órájának beállítása a telefon idejére
+async function syncClock(s) {
+  if (s.busy) return;
+  const st = s.el.querySelector('.dlst'), say = t => st.textContent = t;
+  if (!s.svc || !s.dev.gatt.connected) { say('Nincs kapcsolat.'); return; }
+  s.busy = true;
+  try {
+    const ch = await s.svc.getCharacteristic(U('ccb7'));
+    const cur = await ch.readValue();
+    if (cur.byteLength < 4) throw new Error('váratlan óra-formátum: ' + hex(cur));
+    const before = Math.round(Date.now() / 1000) - cur.getUint32(0, true);
+    // a meglévő érték hosszát és a további bájtokat (pl. időzóna) megtartjuk, csak az első 4 bájtot (Unix-idő) írjuk át
+    const buf = new Uint8Array(cur.buffer.slice(cur.byteOffset, cur.byteOffset + cur.byteLength));
+    new DataView(buf.buffer).setUint32(0, Math.round(Date.now() / 1000), true);
+    await ch.writeValueWithResponse(buf);
+    const after = await ch.readValue();
+    const diff = Math.abs(Math.round(Date.now() / 1000) - after.getUint32(0, true));
+    const fmt = d => Math.abs(d) >= 120 ? Math.round(Math.abs(d) / 60) + ' perc' : Math.abs(d) + ' mp';
+    say('Óra beállítva (előtte ' + fmt(before) + (before >= 0 ? ' késett' : ' sietett') + ', most ' + fmt(diff) + ' eltérés). A korábbi előzmények a régi időbélyeggel maradnak, ezért érdemes előbb letölteni őket.');
+  } catch (e) {
+    say('Hiba: ' + e.message);
+  } finally { s.busy = false; }
 }
 
 // a hőmérő óránkénti pontjai csak ott kellenek, ahol nincs saját (percenkénti) mérés
