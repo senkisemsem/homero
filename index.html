@@ -42,7 +42,7 @@
 <div id="msg"></div>
 <div id="ranges"><span>Grafikon:</span></div>
 <div id="list"></div>
-<p class="note">Max. 3 hőmérő. Az előzményeket az oldal rögzíti (percenként egy mérés, 14 napig), ezért csak azt látod, ami alatt az oldal nyitva volt és kapcsolódott.</p>
+<p class="note">Max. 3 hőmérő. Az oldal percenként rögzít egy mérést 14 napig. A „Előzmények letöltése" gomb a hőmérő belső, órás bontású memóriáját olvassa ki (min/max átlaga), így a nyitva töltött időn kívüli időszak is megjelenik.</p>
 
 <script>
 const SERVICE = 'ebe0ccb0-7a0a-4b0c-8a1a-6ff2997da3a6';
@@ -50,7 +50,9 @@ const CHAR = 'ebe0ccc1-7a0a-4b0c-8a1a-6ff2997da3a6';
 const MAX = 3;
 const SAMPLE_EVERY = 60;           // mp
 const KEEP = 14 * 86400;           // mp
-const RANGES = [['1 ó', 3600], ['6 ó', 6 * 3600], ['24 ó', 86400], ['7 nap', 7 * 86400]];
+const RANGES = [['1 ó', 3600], ['6 ó', 6 * 3600], ['24 ó', 86400], ['7 nap', 7 * 86400], ['30 nap', 30 * 86400]];
+const U = h => 'ebe0' + h + '-7a0a-4b0c-8a1a-6ff2997da3a6';
+const hex = dv => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b => b.toString(16).padStart(2, '0')).join(' ');
 const devices = new Map();
 let range = 6 * 3600;
 try { range = +localStorage.getItem('range') || range; } catch (_) {}
@@ -127,17 +129,19 @@ function addCard(dev) {
     <div class="vals"><span class="t">–</span><span class="h">–</span></div>
     <div class="meta"><span class="dew">Harmatpont: –</span><span class="bat">Elem: –</span><span class="st">Csatlakozás…</span></div>
     <div class="legend"><span><i style="background:var(--acc)"></i>Hőmérséklet (°C)</span><span><i style="background:var(--hum)"></i>Páratartalom (%)</span></div>
-    <canvas></canvas>`;
+    <canvas></canvas>
+    <div class="meta" style="margin-top:8px"><button class="sec dl">Előzmények letöltése a hőmérőből</button><span class="dlst"></span></div>`;
   el.querySelector('.name').textContent = dev.name || 'Hőmérő';
   $('list').appendChild(el);
-  const s = { dev, el, stop: false, canvas: el.querySelector('canvas'), hist: loadHist(dev), dirty: false, lastT: 0, redraw: 0 };
+  const s = { dev, el, stop: false, canvas: el.querySelector('canvas'), hist: loadHist(dev), devHist: loadDev(dev), dirty: false, lastT: 0, svc: null, busy: false };
   if (s.hist.length) s.lastT = s.hist[s.hist.length - 1][0];
   devices.set(dev.id, s);
+  el.querySelector('.dl').onclick = () => downloadHistory(s);
   el.querySelector('.rm').onclick = () => {
     s.stop = true;
     try { dev.gatt.disconnect(); } catch (_) {}
     try { if (dev.forget) dev.forget(); } catch (_) {}
-    try { localStorage.removeItem(histKey(dev)); } catch (_) {}
+    try { localStorage.removeItem(histKey(dev)); localStorage.removeItem(devKey(dev)); } catch (_) {}
     el.remove(); devices.delete(dev.id);
   };
   dev.addEventListener('gattserverdisconnected', () => {
@@ -160,6 +164,7 @@ async function connect(s) {
     setStatus(s, 'Csatlakozás…', false);
     const server = await s.dev.gatt.connect();
     const svc = await server.getPrimaryService(SERVICE);
+    s.svc = svc;
     const ch = await svc.getCharacteristic(CHAR);
     ch.addEventListener('characteristicvaluechanged', ev => update(s, ev.target.value));
     await ch.startNotifications();
@@ -169,6 +174,94 @@ async function connect(s) {
     setStatus(s, 'Hiba: ' + e.message + ' – újrapróbálom…', false);
     setTimeout(() => connect(s), 5000);
   }
+}
+
+// ---- a hőmérő belső (órás) előzményei
+const devKey = dev => 'dev:' + dev.id;
+function loadDev(dev) {
+  try { return JSON.parse(localStorage.getItem(devKey(dev)) || '[]'); } catch (_) { return []; }
+}
+
+async function downloadHistory(s) {
+  if (s.busy) return;
+  const btn = s.el.querySelector('.dl'), st = s.el.querySelector('.dlst');
+  const say = t => st.textContent = t;
+  if (!s.svc || !s.dev.gatt.connected) { say('Nincs kapcsolat.'); return; }
+  s.busy = true; btn.disabled = true;
+  let hc = null, onv = null;
+  try {
+    say('Tartomány lekérdezése…');
+    const rv = await (await s.svc.getCharacteristic(U('ccb9'))).readValue();
+    if (rv.byteLength < 8) throw new Error('váratlan tartomány-formátum: ' + hex(rv));
+    const last = rv.getUint32(0, true), count = rv.getUint32(4, true);
+    if (!count) { say('A hőmérőben még nincs előzmény.'); return; }
+    const start = Math.max(0, last + 1 - count);
+
+    // a hőmérő órája eltérhet a telefonétól – korrigáljuk
+    let offset = 0;
+    try {
+      const cv = await (await s.svc.getCharacteristic(U('ccb7'))).readValue();
+      offset = Math.round(Date.now() / 1000) - cv.getUint32(0, true);
+    } catch (_) {}
+
+    const recs = new Map();
+    let lastRx = Date.now(), bad = '';
+    hc = await s.svc.getCharacteristic(U('ccbc'));
+    onv = ev => {
+      const v = ev.target.value;
+      if (v.byteLength % 14) bad = hex(v);
+      for (let o = 0; o + 14 <= v.byteLength; o += 14) {
+        recs.set(v.getUint32(o, true), {
+          t: v.getUint32(o + 4, true),
+          tmax: v.getInt16(o + 8, true) / 10, hmax: v.getUint8(o + 10),
+          tmin: v.getInt16(o + 11, true) / 10, hmin: v.getUint8(o + 13)
+        });
+      }
+      lastRx = Date.now();
+      say('Letöltés: ' + recs.size + ' / ' + count);
+    };
+    hc.addEventListener('characteristicvaluechanged', onv);
+    const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, start, true);
+    await (await s.svc.getCharacteristic(U('ccba'))).writeValueWithResponse(b);
+    await hc.startNotifications();
+    lastRx = Date.now();
+    const t0 = Date.now();
+    while (recs.size < count && Date.now() - t0 < 240000 &&
+           Date.now() - lastRx < (recs.size ? 3500 : 7000)) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+    if (!recs.size) { say('Nem érkezett adat.' + (bad ? ' Váratlan formátum: ' + bad : '')); return; }
+
+    const now = Date.now() / 1000;
+    const pts = [...recs.entries()].sort((a, b) => a[0] - b[0])
+      .map(([, r]) => [r.t + offset - 1800, +((r.tmax + r.tmin) / 2).toFixed(2), Math.round((r.hmax + r.hmin) / 2), 1])
+      .filter(p => p[0] > 1.5e9 && p[0] < now + 86400);
+    if (!pts.length) { say('Az időbélyegek érvénytelenek (a hőmérő órája hibás?).'); return; }
+    s.devHist = pts;
+    try { localStorage.setItem(devKey(s.dev), JSON.stringify(pts)); } catch (_) {}
+    const d0 = new Date(pts[0][0] * 1000).toLocaleDateString('hu-HU');
+    say('Kész: ' + pts.length + ' óra (' + d0 + '-tól)' + (recs.size < count ? ', hiányos' : ''));
+    draw(s);
+  } catch (e) {
+    say('Hiba: ' + e.message);
+  } finally {
+    try { if (hc) { hc.removeEventListener('characteristicvaluechanged', onv); await hc.stopNotifications(); } } catch (_) {}
+    s.busy = false; btn.disabled = false;
+  }
+}
+
+// a hőmérő óránkénti pontjai csak ott kellenek, ahol nincs saját (percenkénti) mérés
+function points(s, from) {
+  const own = s.hist, out = [];
+  let j = 0;
+  for (const p of s.devHist) {
+    if (p[0] < from) continue;
+    while (j < own.length && own[j][0] < p[0] - 1800) j++;
+    if (j < own.length && own[j][0] <= p[0] + 1800) continue;
+    out.push(p);
+  }
+  for (const p of own) if (p[0] >= from) out.push(p);
+  return out.sort((a, b) => a[0] - b[0]);
 }
 
 // harmatpont (Magnus-képlet)
@@ -219,7 +312,7 @@ function draw(s) {
   ctx.font = '11px system-ui, sans-serif';
 
   const now = Date.now() / 1000;
-  const pts = s.hist.filter(p => p[0] >= now - range);
+  const pts = points(s, now - range);
   if (pts.length < 2) {
     ctx.fillStyle = cMut; ctx.textAlign = 'center';
     ctx.fillText('Még kevés adat a grafikonhoz', w / 2, h / 2);
@@ -265,11 +358,12 @@ function draw(s) {
   const line = (idx, Y, color) => {
     ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = 'round';
     ctx.beginPath();
-    let prev = null;
+    let prev = null, prevDev = false;
     for (const p of pts) {
       const x = X(p[0]), y = Y(p[idx]);
-      if (prev === null || p[0] - prev > SAMPLE_EVERY * 5) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-      prev = p[0];
+      const gap = (prevDev || p[3]) ? 5400 : SAMPLE_EVERY * 5;
+      if (prev === null || p[0] - prev > gap) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      prev = p[0]; prevDev = !!p[3];
     }
     ctx.stroke();
   };
