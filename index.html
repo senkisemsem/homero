@@ -128,13 +128,14 @@ function addCard(dev) {
     <div class="top"><span class="name"></span><button class="sec rm">Eltávolít</button></div>
     <div class="vals"><span class="t">–</span><span class="h">–</span></div>
     <div class="meta"><span class="dew">Harmatpont: –</span><span class="bat">Elem: –</span><span class="st">Csatlakozás…</span></div>
+    <div class="st clk" style="margin-top:6px">Hőmérő órája: –</div>
     <div class="legend"><span><i style="background:var(--acc)"></i>Hőmérséklet (°C)</span><span><i style="background:var(--hum)"></i>Páratartalom (%)</span></div>
     <canvas></canvas>
     <div class="meta" style="margin-top:8px"><button class="sec dl">Előzmények letöltése a hőmérőből</button><button class="sec sync">Óra szinkron</button></div>
     <div class="st dlst" style="margin-top:6px"></div>`;
   el.querySelector('.name').textContent = dev.name || 'Hőmérő';
   $('list').appendChild(el);
-  const s = { dev, el, stop: false, canvas: el.querySelector('canvas'), hist: loadHist(dev), devHist: loadDev(dev), dirty: false, lastT: 0, svc: null, busy: false };
+  const s = { dev, el, stop: false, canvas: el.querySelector('canvas'), hist: loadHist(dev), devHist: loadDev(dev), dirty: false, lastT: 0, svc: null, busy: false, clockOff: null };
   if (s.hist.length) s.lastT = s.hist[s.hist.length - 1][0];
   devices.set(dev.id, s);
   el.querySelector('.dl').onclick = () => downloadHistory(s);
@@ -171,6 +172,7 @@ async function connect(s) {
     ch.addEventListener('characteristicvaluechanged', ev => update(s, ev.target.value));
     await ch.startNotifications();
     setStatus(s, 'Csatlakozva', true);
+    readClock(s);
   } catch (e) {
     if (s.stop) return;
     setStatus(s, 'Hiba: ' + e.message + ' – újrapróbálom…', false);
@@ -252,6 +254,28 @@ async function downloadHistory(s) {
   }
 }
 
+// a hőmérő órájának kiolvasása és élő megjelenítése
+async function readClock(s) {
+  try {
+    if (!s.svc || !s.dev.gatt.connected) return;
+    const cv = await (await s.svc.getCharacteristic(U('ccb7'))).readValue();
+    if (cv.byteLength < 4) return;
+    s.clockOff = cv.getUint32(0, true) - Math.round(Date.now() / 1000);
+    renderClock(s);
+  } catch (_) {}
+}
+function renderClock(s) {
+  const el = s.el.querySelector('.clk');
+  if (s.clockOff === null) return;
+  const off = s.clockOff;
+  const dt = new Date((Date.now() / 1000 + off) * 1000);
+  const a = Math.abs(off);
+  const diff = a < 5 ? 'pontos' : (a >= 120 ? Math.round(a / 60) + ' perc' : a + ' mp') + (off > 0 ? ' siet' : ' késik');
+  el.textContent = 'Hőmérő órája: ' + dt.toLocaleString('hu-HU') + ' (' + diff + ')';
+}
+setInterval(() => devices.forEach(renderClock), 1000);
+setInterval(() => devices.forEach(s => { if (!s.busy) readClock(s); }), 60000);
+
 // a hőmérő órájának beállítása a telefon idejére
 async function syncClock(s) {
   if (s.busy) return;
@@ -271,6 +295,7 @@ async function syncClock(s) {
     const diff = Math.abs(Math.round(Date.now() / 1000) - after.getUint32(0, true));
     const fmt = d => Math.abs(d) >= 120 ? Math.round(Math.abs(d) / 60) + ' perc' : Math.abs(d) + ' mp';
     say('Óra beállítva (előtte ' + fmt(before) + (before >= 0 ? ' késett' : ' sietett') + ', most ' + fmt(diff) + ' eltérés). A korábbi előzmények a régi időbélyeggel maradnak, ezért érdemes előbb letölteni őket.');
+    readClock(s);
   } catch (e) {
     say('Hiba: ' + e.message);
   } finally { s.busy = false; }
