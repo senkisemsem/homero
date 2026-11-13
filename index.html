@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b7a75">
+<link rel="icon" href="icon-192.png">
 <title>Mi hőmérők – BLE</title>
 <style>
   :root { color-scheme: light dark; --bg:#f4f6f8; --card:#fff; --fg:#14181c; --mut:#6b7680; --acc:#0b7a75; --bad:#b3261e; --line:#e1e5e9; }
@@ -119,6 +122,7 @@ function update(s, dv) {
   s.el.querySelector('.bat').textContent = 'Elem: ' + volt.toFixed(2) + ' V (~' + pct + '%)';
   setStatus(s, 'Frissítve: ' + new Date().toLocaleTimeString('hu-HU'), true);
 }
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
 </script>
 </body>
 </html>
